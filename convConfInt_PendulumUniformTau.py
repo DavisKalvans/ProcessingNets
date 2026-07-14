@@ -1,0 +1,290 @@
+import argparse
+import numpy as np
+import torch
+import matplotlib.pyplot as plt
+from numerical_methods import eulerStepNumpy_Pendulum, verletStepNumpy_Pendulum
+from scipy.integrate import solve_ivp  
+from TrainingData.general_problems import Pendulum
+import scipy.stats as st
+
+# Plotting setup
+import matplotlib
+matplotlib.rc('font', size=24) # 24
+matplotlib.rc('axes', titlesize=20) #20
+
+plt.rcParams.update({
+  "text.usetex": True,
+  "font.family": "serif"
+})
+
+def build_argparser():
+    p = argparse.ArgumentParser(description="Convergence graph for Pendulum (const tau).")
+
+    # PyTorch args
+    p.add_argument("--threads", type = int, default = 1)
+    p.add_argument("--device", type = str, default = "cpu")
+
+    # Training/testing data
+    p.add_argument("--N", type = int, default = 320)
+    p.add_argument("--M", type = int, default = 80)
+    p.add_argument("--T1", type = float, default = 0.05)
+    p.add_argument("--T2", type = float, default = 0.2)
+    p.add_argument("--data_num", type = int, required = True)
+
+    # Model params
+    p.add_argument("--k", type = int, required = True)
+    p.add_argument("--kernel", type = str, required = True)
+    p.add_argument("--epochs", type = int, default = 100000)
+    p.add_argument("--learning_rate", type = float, default = 1e-3)
+    p.add_argument("--sch", type = bool, default = True)
+    p.add_argument("--eta1", type = float, default = 1e-1)
+    p.add_argument("--eta2", type = float, default = 1e-3)
+
+    p.add_argument("--nL", type = int, required = True)
+    p.add_argument("--nN", type = int, required = True)
+    p.add_argument("--nM", type = int, required = True)
+
+    # For convergence graphs
+    p.add_argument("--Tend", type = float, default = 10)
+    p.add_argument("--nr_trajects", type = int, default = 100)
+    p.add_argument("--conf", type = float, default = 0.9)
+
+    return p
+
+def main(argv = None):
+    args = build_argparser().parse_args(argv)
+
+    # PyTorch setup 
+    torch.set_num_threads(args.threads)
+    torch.set_default_dtype(torch.float64)
+    device = args.device
+
+    # Model parameters
+    N, M, data_num = args.N, args.M, args.data_num # Training data, testing data, data_num = '123' - timesteps from U[0.05, 0.2]
+
+    epochs = args.epochs
+    epochs_th = str(epochs/1000).replace('.0', '')
+
+    # Parameters regarding scheduling
+    learning_rate = args.learning_rate # Not used if sch = True
+    sch = args.sch # Use scheduling for learning rate
+    eta1 = args.eta1 # For scheduling (starting learning rate)
+    eta2 = args.eta2 # For scheduling (ending learning rate)
+    gamma = np.exp(np.log(eta2/eta1)/epochs)
+
+    if sch:
+        learning_rate = eta1
+        eta1_txt = str(np.log10(eta1)).replace('-', '').replace('.0', '')
+        eta2_txt = str(np.log10(eta2)).replace('-', '').replace('.0', '')
+    else:
+        eta1_txt = str(np.log10(learning_rate)).replace('-', '').replace('.0', '')
+
+
+    # Parameters for the problem (Pendulum)
+    problem = "PendulumUniTau"
+    kernel = args.kernel
+    numeric_stepNumpy = verletStepNumpy_Pendulum
+    if kernel == "Euler":
+        numeric_stepNumpy = eulerStepNumpy_Pendulum
+    elif kernel == "Verlet":
+        numeric_stepNumpy = verletStepNumpy_Pendulum
+
+    k = args.k # tau exponent, natural number
+
+    # Same as area from training data
+    q_max = np.pi
+    p_max = 2
+
+    # Confidence level # How many trajectories to make predictions for
+    conf = args.conf
+
+    nr_trajects = args.nr_trajects
+    trajec_done = 0
+    qs = []
+    ps = []
+    np.random.seed(11)
+
+    while trajec_done != nr_trajects: # Generate starting points for training
+        q = 2*q_max*np.random.rand()-q_max 
+        p = 2*p_max*np.random.rand()-p_max 
+        point = np.array([[q, p]])
+
+        if np.abs(Pendulum.H(point) < 1): # Only take periodic trajectories, i.e. satisfying -1<H(q,p)<1
+            qs.append(q)
+            ps.append(p)
+            trajec_done += 1
+
+    x0s = []
+    for i in range(nr_trajects):
+        x0s.append([])
+
+        x0s[-1].append(qs[i]) # q value
+        x0s[-1].append(ps[i]) # p value
+
+    d = len(x0s[0]) # dimension of problem
+    D = int(d/2)
+
+    taus = np.array([1, 10/12, 10/14, 10/16, 0.5, 0.4, 10/35, 10/39, 10/42, 0.2, 10/55, 10/60, 10/65, 10/70, 10/75, 10/80, 10/85, 10/90, 10/95,  0.1, 10/110, 10/120, 10/130, 10/140, 10/150, 10/160, 10/170, 0.05, 10/230, 10/270, 10/300, 10/350, 10/400, 10/450, 0.01, 0.005, 0.001], dtype = np.float64)
+
+    Tend = args.Tend # How long to make predictions for
+
+    # Get initial "analytical" solutions with a solver, to compute pred error at endpoint Tend later
+    exacts = []
+    H0s = []
+
+    for i in range(nr_trajects):
+        exact = solve_ivp(Pendulum.problem, [0, Tend], x0s[i], method='RK45', rtol = 1e-12, atol = 1e-12)
+        exact = exact.y.T[-1]
+        exact = exact.reshape((d))
+        exacts.append(exact)
+
+        H0 = Pendulum.H(np.array([x0s[i]]).reshape((1, d)))
+        H0s.append(H0)
+
+
+    # Load selected model
+    nL, nN, nM = args.nL, args.nN, args.nM
+    f = str(nL) + "L" + str(nN) + "n" + str(nM) + "m"
+    if sch:
+        model_name = f'TrainedModels/{kernel +f"_k{k}"}/{problem}/sch{problem}Rand_N{N}M{M}UniformTau{data_num}_{epochs_th}TH_{eta1_txt}eta1_{eta2_txt}eta2_' +f
+    else:
+        model_name = f'TrainedModels/{kernel +f"_k{k}"}/{problem}/{problem}RandN{N}M{M}UniformTau{data_num}_{epochs_th}TH_{eta1_txt}eta1_' +f
+
+    model, *_ = torch.load(model_name, weights_only=False)
+
+
+    # To save all the values
+    errors = np.zeros(len(taus))
+    errors_numeric = np.zeros(len(taus))
+    errors_energy = np.zeros(len(taus))
+    errors_energy_numeric = np.zeros(len(taus))
+
+    # To actually save all values for the confidence interval calculation
+    errors_all = [[] for _ in range(len(taus))]
+    errors_numeric_all = [[] for _ in range(len(taus))]
+    errors_energy_all = [[] for _ in range(len(taus))]
+    errors_energy_numeric_all = [[] for _ in range(len(taus))]
+                
+    for tr in range(nr_trajects):
+        # Save everything in lists, for different tau values
+        predictions = []
+        predictions_numeric = []
+        energies_pred = []
+        energies_numeric = []
+
+
+        ### Calculate everything with differing tau values
+        for tau in taus:
+            MM = int(Tend/tau) # Time steps
+            tm = np.linspace(0, Tend, MM+1)
+
+            # Get model predictions
+            pred_preprocess = np.zeros([MM+1, d])
+            Z = torch.tensor(x0s[tr], dtype=torch.float64, device=device).reshape((1, 1, d))
+            Tau = torch.tensor([[[tau]]], dtype=torch.float64, device=device)
+
+            with torch.no_grad():
+                preprocess, _ = model(Z, Tau) # Pass trough model
+
+            pred_preprocess[0] = preprocess.reshape((1, d)).numpy()
+
+            for i in range(MM): # Do the kernel method
+                pred_preprocess[i+1] = numeric_stepNumpy(pred_preprocess[i], tau)
+                            
+            pred_preprocess = torch.from_numpy(np.float64(pred_preprocess)).reshape((MM+1, 1, d))
+            with torch.no_grad():
+                pred, _ = model.back(pred_preprocess, Tau) # Pass trough inverse model
+
+            pred = pred.reshape(MM+1, d)
+            predictions.append(pred[-1].numpy()) 
+            energies_pred.append(Pendulum.H(pred).numpy())
+
+            # Get numerical method predictions
+            pred_numeric = np.zeros([MM+1, d])
+            pred_numeric[0, :] = x0s[tr]
+
+            for i in range(MM): 
+                pred_numeric[i+1] = numeric_stepNumpy(pred_numeric[i], tau)
+                        
+            predictions_numeric.append(pred_numeric[-1])
+            energies_numeric.append(Pendulum.H(pred_numeric))
+
+        ### Calculate errors for our predictions at endpoint
+        # and energy/angular errors as max deviation in the whole interval [0, Tend]
+        for i in range(len(taus)):
+            errors[i] += np.sqrt(np.sum((predictions[i] - exacts[tr])**2, 0)) /np.sqrt(np.sum((exacts[tr])**2, 0))
+            errors_all[i].append(np.sqrt(np.sum((predictions[i] - exacts[tr])**2, 0)) /np.sqrt(np.sum((exacts[tr])**2, 0)))
+
+            errors_numeric[i] += np.sqrt(np.sum((predictions_numeric[i] -exacts[tr])**2, 0)) /np.sqrt(np.sum((exacts[tr])**2, 0))
+            errors_numeric_all[i].append(np.sqrt(np.sum((predictions_numeric[i] -exacts[tr])**2, 0)) /np.sqrt(np.sum((exacts[tr])**2, 0)))
+
+            errors_energy[i] += max(abs((energies_pred[i] -H0s[tr])/H0s[tr]))
+            errors_energy_all[i].append(max(abs((energies_pred[i] -H0s[tr])/H0s[tr])))
+
+            errors_energy_numeric[i] += max(abs((energies_numeric[i] -H0s[tr])/H0s[tr]))
+            errors_energy_numeric_all[i].append(max(abs((energies_numeric[i] -H0s[tr])/H0s[tr])))
+
+    # Plot name
+    plot_name = model_name.replace(f'{problem}/', f'{problem}/ConvGraphs/')
+
+    ### Lines with specific order, to compare numeric method to new method
+    line1 = np.array(taus)**1
+    line2 = np.array(taus)**2
+
+    ### Plot absolute errors
+    fig1, ax = plt.subplots(figsize=(9, 6.5))
+    ax.loglog(np.array(taus), errors/nr_trajects, color = 'tab:red', ls='--', marker='s', linewidth = '1.5', label = f'Proc. {kernel}')
+    ax.loglog(np.array(taus), errors_numeric/nr_trajects, color = 'tab:green', ls='-', marker='o', linewidth = '1.5', label = f'{kernel}')
+    #ax.loglog(np.array(taus), line1, color = 'k', label = "line of slope 1")
+    #ax.loglog(np.array(taus), line2, color = 'k', label = "line of slope 2")
+
+    # Confidence intervals
+    error_ci = np.zeros((len(taus), 2))
+    error_numeric_ci = np.zeros((len(taus), 2))
+    error_energy_ci = np.zeros((len(taus), 2))
+    error_energy_numeric_ci = np.zeros((len(taus), 2))
+
+    for i in range(len(taus)):
+        error_ci[i] = st.t.interval(conf, len(errors_all[i])-1, loc = np.mean(errors_all[i]), scale = st.sem(errors_all[i]))
+        error_numeric_ci[i] = st.t.interval(conf, len(errors_numeric_all[i])-1, loc = np.mean(errors_numeric_all[i]), scale = st.sem(errors_numeric_all[i]))
+        error_energy_ci[i] = st.t.interval(conf, len(errors_energy_all[i])-1, loc = np.mean(errors_energy_all[i]), scale = st.sem(errors_energy_all[i]))
+        error_energy_numeric_ci[i] = st.t.interval(conf, len(errors_energy_numeric_all[i])-1, loc = np.mean(errors_energy_numeric_all[i]), scale = st.sem(errors_energy_numeric_all[i]))
+
+    ax.fill_between(np.array(taus), error_ci[:, 0], error_ci[:, 1], color = 'r', alpha=.1)
+    ax.fill_between(np.array(taus), error_numeric_ci[:, 0], error_numeric_ci[:, 1], color = 'g', alpha=.1)
+    ax.axis([10**(-3), 10**(0), 10**(-7), 10**(0)])
+    plt.xticks([10**(-3), 10**(-2), 10**(-1), 0.2, 0.5, 10**(0)])
+    plt.yticks([10**(-7), 10**(-6), 10**(-5), 10**(-4), 
+                            10**(-3), 10**(-2), 10**(-1), 10**(0)])
+
+    ax.legend(loc=4, prop={'size':20})
+    ax.grid(True)
+    ax.set_xlabel(r'$\tau$')
+    ax.set_ylabel('Solution error')
+    ax.set_title(f"{kernel} Pendulum: k={k}, L={nL}, N={nN}, M={nM}")
+    plt.tight_layout()
+    plt.savefig(plot_name + '_mse', dpi=300, bbox_inches='tight')
+    plt.show()
+
+    ### Plots hamiltonian errors
+    fig2, ax = plt.subplots(figsize=(9, 6.5))
+    ax.loglog(np.array(taus), errors_energy/nr_trajects, color = 'tab:red', ls='--', marker='s', linewidth = '1.5', label = f'Proc. {kernel}')
+    ax.loglog(np.array(taus), errors_energy_numeric/nr_trajects, color = 'tab:green', ls='-', marker='o', linewidth = '1.5', label = f'{kernel}')
+    #ax.loglog(np.array(taus), line1, color = 'k', label = "line of slope 1")
+    #ax.loglog(np.array(taus), line2, color = 'k', label = "line of slope 2")
+    ax.fill_between(np.array(taus), error_energy_ci[:, 0], error_energy_ci[:, 1], color = 'r', alpha=.1)
+    ax.fill_between(np.array(taus), error_energy_numeric_ci[:, 0], error_energy_numeric_ci[:, 1], color = 'g', alpha=.1)
+
+    ax.axis([10**(-3), 10**(0), 10**(-7), 10**(0)])
+    plt.xticks([10**(-3), 10**(-2), 10**(-1), 0.2, 0.5, 10**(0)])
+    plt.yticks([10**(-7), 10**(-6), 10**(-5), 10**(-4), 
+                10**(-3), 10**(-2), 10**(-1), 10**(0)])
+
+    ax.legend(loc=4, prop={'size':20})
+    ax.grid(True)
+    ax.set_xlabel(r'$\tau$')
+    ax.set_ylabel('Hamiltonian error')
+    ax.set_title(f"{kernel} Pendulum: k={k}, L={nL}, N={nN}, M={nM}")
+    plt.tight_layout()
+    plt.savefig(plot_name + '_ham', dpi=300, bbox_inches='tight')
+    plt.show()
